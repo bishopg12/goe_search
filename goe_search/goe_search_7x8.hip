@@ -298,38 +298,66 @@ int solve_sat_hard_state(uint64_t T) {
     
     int w = 7, h = 8;
     int p_w = w + 2, p_h = h + 2;
+    int num_p_vars = p_w * p_h;
+    int aux_var_offset = num_p_vars + 1;
     
     for (int ty = 0; ty < h; ty++) {
         for (int tx = 0; tx < w; tx++) {
-            int p_vars[9] = {
-                (ty)*p_w + tx + 1,   (ty)*p_w + tx+1 + 1,   (ty)*p_w + tx+2 + 1,
-                (ty+1)*p_w + tx + 1, (ty+1)*p_w + tx+1 + 1, (ty+1)*p_w + tx+2 + 1,
-                (ty+2)*p_w + tx + 1, (ty+2)*p_w + tx+1 + 1, (ty+2)*p_w + tx+2 + 1
-            };
-            int t_var = p_w * p_h + ty * w + tx + 1;
+            int c_var = (ty+1)*p_w + (tx+1) + 1;
             
-            int bit_idx = ty * 7 + tx;
+            int n_vars[8];
+            int n_idx = 0;
+            for (int dy = 0; dy <= 2; dy++) {
+                for (int dx = 0; dx <= 2; dx++) {
+                    if (dy == 1 && dx == 1) continue;
+                    n_vars[n_idx++] = (ty+dy)*p_w + (tx+dx) + 1;
+                }
+            }
+            
+            int S[9][5];
+            for (int i = 1; i <= 8; i++) {
+                for (int j = 1; j <= 4; j++) {
+                    S[i][j] = aux_var_offset++;
+                }
+            }
+            
+            kissat_add(solver, -S[1][1]); kissat_add(solver, n_vars[0]); kissat_add(solver, 0);
+            kissat_add(solver, S[1][1]); kissat_add(solver, -n_vars[0]); kissat_add(solver, 0);
+            
+            kissat_add(solver, -S[1][2]); kissat_add(solver, 0);
+            kissat_add(solver, -S[1][3]); kissat_add(solver, 0);
+            kissat_add(solver, -S[1][4]); kissat_add(solver, 0);
+            
+            for (int i = 2; i <= 8; i++) {
+                int Ni = n_vars[i-1];
+                
+                kissat_add(solver, -S[i-1][1]); kissat_add(solver, S[i][1]); kissat_add(solver, 0);
+                kissat_add(solver, -Ni); kissat_add(solver, S[i][1]); kissat_add(solver, 0);
+                kissat_add(solver, S[i-1][1]); kissat_add(solver, Ni); kissat_add(solver, -S[i][1]); kissat_add(solver, 0);
+                
+                for (int j = 2; j <= 4; j++) {
+                    kissat_add(solver, -S[i-1][j]); kissat_add(solver, S[i][j]); kissat_add(solver, 0);
+                    kissat_add(solver, -S[i-1][j-1]); kissat_add(solver, -Ni); kissat_add(solver, S[i][j]); kissat_add(solver, 0);
+                    kissat_add(solver, S[i-1][j]); kissat_add(solver, S[i-1][j-1]); kissat_add(solver, -S[i][j]); kissat_add(solver, 0);
+                    kissat_add(solver, S[i-1][j]); kissat_add(solver, Ni); kissat_add(solver, -S[i][j]); kissat_add(solver, 0);
+                }
+            }
+            
+            int bit_idx = ty * w + tx;
             bool target_alive = (T >> bit_idx) & 1;
             
-            kissat_add(solver, target_alive ? t_var : -t_var);
-            kissat_add(solver, 0);
+            int s2 = S[8][2];
+            int s3 = S[8][3];
+            int s4 = S[8][4];
+            int c = c_var;
             
-            for (int i = 0; i < 512; i++) {
-                int p_vals[9];
-                int sum = 0;
-                for (int j = 0; j < 9; j++) {
-                    p_vals[j] = (i >> j) & 1;
-                    if (j != 4) sum += p_vals[j];
-                }
-                bool expected = false;
-                if (p_vals[4]) expected = (sum == 2 || sum == 3);
-                else expected = (sum == 3);
-                
-                for (int j = 0; j < 9; j++) {
-                    kissat_add(solver, p_vals[j] ? -p_vars[j] : p_vars[j]);
-                }
-                kissat_add(solver, expected ? -t_var : t_var);
-                kissat_add(solver, 0);
+            if (target_alive) {
+                kissat_add(solver, s2); kissat_add(solver, 0);
+                kissat_add(solver, c); kissat_add(solver, s3); kissat_add(solver, 0);
+                kissat_add(solver, -s4); kissat_add(solver, 0);
+            } else {
+                kissat_add(solver, -s2); kissat_add(solver, -c); kissat_add(solver, s4); kissat_add(solver, 0);
+                kissat_add(solver, -s3); kissat_add(solver, s4); kissat_add(solver, 0);
             }
         }
     }
