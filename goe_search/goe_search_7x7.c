@@ -171,7 +171,7 @@ int main(int argc, char** argv) {
     
     // Total state space is 2^49 for a 7x7 grid
     uint64_t total_T = 1ULL << 49;
-    uint64_t step_size = num_procs * 5000000000ULL;
+    uint64_t step_size = num_procs * 1500000000ULL;
     uint64_t T_current = 0, total_orphans = 0;
 
     // Rank 0 handles checkpoint loading
@@ -302,13 +302,14 @@ int main(int argc, char** argv) {
                    speed / 1000000.0, hours, minutes);
             fflush(stdout);
 
-            // Periodic checkpointing
-            if (MPI_Wtime() - last_checkpoint_time > 300.0) {
-                FILE *chk = fopen("checkpoint.dat", "w");
+            // Periodic checkpointing (Atomic write for Spot Instances)
+            if (MPI_Wtime() - last_checkpoint_time > 1200.0) {
+                FILE *chk = fopen("checkpoint_tmp.dat", "w");
                 if (chk) {
                     fprintf(chk, "%llu\n", (unsigned long long)T_current);
                     fprintf(chk, "%llu\n", (unsigned long long)total_orphans);
                     fclose(chk);
+                    rename("checkpoint_tmp.dat", "checkpoint.dat");
                 }
                 last_checkpoint_time = MPI_Wtime();
             }

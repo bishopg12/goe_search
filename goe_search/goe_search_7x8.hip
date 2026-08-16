@@ -479,7 +479,7 @@ int main(int argc, char** argv) {
     }
     
     uint64_t T_MAX = 1ULL << 56; // 7x8 state space
-    uint64_t step_size = 45000000000ULL; // Process in chunks of 45B states
+    uint64_t step_size = 10000000000ULL; // Process in chunks of 10B states
     uint64_t T_current = 0;
     
     // Checkpointing and Load Balancing
@@ -572,13 +572,14 @@ int main(int argc, char** argv) {
         MPI_Barrier(MPI_COMM_WORLD);
 
         if (rank == 0) {
-            FILE* f = fopen("checkpoint_7x8.dat", "w");
+            FILE* f = fopen("checkpoint_7x8_tmp.dat", "w");
             if (f) {
                 fprintf(f, "%llu\n", (unsigned long long)T_end);
                 for (int i = 0; i < world_size; i++) {
                     fprintf(f, "%d\n", node_weights[i]);
                 }
                 fclose(f);
+                rename("checkpoint_7x8_tmp.dat", "checkpoint_7x8.dat");
             }
             printf("Progress: %llu / %llu (%.2f%%) - Orphans found: %llu, Time: %.2f s\n", 
                    (unsigned long long)T_end, (unsigned long long)T_MAX, 
