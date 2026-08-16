@@ -20,3 +20,4 @@ goe_search_7x7*
 !goe_search_7x7*.cpp
 !goe_search_7x7*.hip
 local_scripts/
+kissat/

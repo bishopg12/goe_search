@@ -231,11 +231,8 @@ int main(int argc, char** argv) {
 
                 #pragma omp for schedule(dynamic, 10000)
                 for (uint64_t p = T_current; p < T_end; p++) {
-                    if (p % 100000 == 0) {
-                        printf("Reached %llu\n", (unsigned long long)p);
-                        fflush(stdout);
-                    }
                     
+
                     // Filter tasks based on hash assignment
                     if (mix_hash(p) % HASH_RANGE < my_start_hash || mix_hash(p) % HASH_RANGE >= my_end_hash) continue;
                     

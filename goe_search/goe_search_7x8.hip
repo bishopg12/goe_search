@@ -279,96 +279,64 @@ __device__ int has_predecessor_dfs(int start_p1, int start_p2, uint64_t T, uint3
     return 0; // Orphan found
 }
 
+extern "C" {
+#include "../kissat/src/kissat.h"
+}
+
 /**
- * @brief Breadth-First Search kernel for handling "hard" states.
+ * @brief Uses Kissat SAT solver to quickly resolve "hard" states.
  *
- * Runs a level-synchronous BFS utilizing GPU shared memory as a bit-vector.
- * Resolves states that hit the DFS bailout threshold (8 levels deep for 7x8).
+ * Mathematically proves whether a target Game of Life pattern has a valid
+ * predecessor using Boolean Satisfiability, bypassing the exponential DFS/BFS.
  *
- * @param d_hard_states Array of hard states to process
- * @param h_hard_count Number of hard states
- * @param d_orphans Pointer to accumulate orphan counts
+ * @param T The 56-bit target pattern
+ * @return 1 if an orphan (UNSAT), 0 otherwise
  */
-__global__ void search_kernel_bfs(uint64_t* d_hard_states, int h_hard_count, unsigned long long* d_orphans) {
-    __shared__ uint32_t s_current[8192]; // Bit vector for current frontier
-    __shared__ uint32_t s_next[8192];    // Bit vector for next frontier
+int solve_sat_hard_state(uint64_t T) {
+    kissat * solver = kissat_init();
+    kissat_set_option(solver, "quiet", 1);
     
-    int block_id = blockIdx.x;
-    if (block_id >= h_hard_count) return;
+    int w = 7, h = 8;
+    int p_w = w + 2, p_h = h + 2;
     
-    uint64_t T = d_hard_states[block_id];
-    int tid = threadIdx.x;
-    
-    // Initialize full current frontier
-    for (int i = tid; i < 8192; i += blockDim.x) {
-        s_current[i] = 0xFFFFFFFF;
-    }
-    __syncthreads();
-    
-    bool empty = false;
-    // Iterate through all 8 rows
-    for (int r = 0; r < 8 && !empty; r++) {
-        for (int i = tid; i < 8192; i += blockDim.x) {
-            s_next[i] = 0;
-        }
-        __syncthreads();
-        
-        int T_r = (T >> (r * 7)) & 127;
-        int T_01 = T_r & 3, T_23 = (T_r >> 2) & 3, T_ri = (T_r >> 4) & 7;
-        
-        for (int i = tid; i < 8192; i += blockDim.x) {
-            uint32_t word = s_current[i];
-            while (word) {
-                int bit = __builtin_ctz(word);
-                word &= (word - 1);
-                
-                int state = (i * 32) + bit;
-                int p1 = state >> 9;
-                int p2 = state & 511;
-                
-                int p1_03 = p1 & 15, p1_25 = (p1 >> 2) & 15, p1_r = (p1 >> 4) & 31;
-                int p2_03 = p2 & 15, p2_25 = (p2 >> 2) & 15, p2_r = (p2 >> 4) & 31;
-                
-                uint64_t mask1 = c_small_left_p3[T_01][p1_03][p2_03];
-                uint64_t mask2 = c_small_left_p3[T_23][p1_25][p2_25];
-                uint64_t expanded1 = mask1 | (mask1 << 16) | (mask1 << 32) | (mask1 << 48);
-                uint64_t expanded2 = c_expand_8bit[mask2 & 255] | ((uint64_t)c_expand_8bit[mask2 >> 8] << 32);
-                uint64_t l_mask = expanded1 & expanded2;
-                uint32_t r_mask = c_right_p3[T_ri][p1_r][p2_r];
-                
-                while (l_mask) {
-                    int p3_l = __builtin_ctzll(l_mask);
-                    l_mask &= (l_mask - 1);
-                    
-                    uint32_t valid_r = r_mask & c_overlap_mask[p3_l >> 4];
-                    while (valid_r) {
-                        int p3_r = __builtin_ctz(valid_r);
-                        valid_r &= (valid_r - 1);
-                        int p3 = p3_l | (p3_r << 4);
-                        
-                        int next_state = (p2 << 9) | p3;
-                        // Thread-safe OR operation into next frontier bit vector
-                        atomicOr(&s_next[next_state / 32], 1U << (next_state % 32));
-                    }
+    for (int ty = 0; ty < h; ty++) {
+        for (int tx = 0; tx < w; tx++) {
+            int p_vars[9] = {
+                (ty)*p_w + tx + 1,   (ty)*p_w + tx+1 + 1,   (ty)*p_w + tx+2 + 1,
+                (ty+1)*p_w + tx + 1, (ty+1)*p_w + tx+1 + 1, (ty+1)*p_w + tx+2 + 1,
+                (ty+2)*p_w + tx + 1, (ty+2)*p_w + tx+1 + 1, (ty+2)*p_w + tx+2 + 1
+            };
+            int t_var = p_w * p_h + ty * w + tx + 1;
+            
+            int bit_idx = ty * 7 + tx;
+            bool target_alive = (T >> bit_idx) & 1;
+            
+            kissat_add(solver, target_alive ? t_var : -t_var);
+            kissat_add(solver, 0);
+            
+            for (int i = 0; i < 512; i++) {
+                int p_vals[9];
+                int sum = 0;
+                for (int j = 0; j < 9; j++) {
+                    p_vals[j] = (i >> j) & 1;
+                    if (j != 4) sum += p_vals[j];
                 }
+                bool expected = false;
+                if (p_vals[4]) expected = (sum == 2 || sum == 3);
+                else expected = (sum == 3);
+                
+                for (int j = 0; j < 9; j++) {
+                    kissat_add(solver, p_vals[j] ? -p_vars[j] : p_vars[j]);
+                }
+                kissat_add(solver, expected ? -t_var : t_var);
+                kissat_add(solver, 0);
             }
         }
-        __syncthreads();
-        
-        if (tid == 0) empty = true;
-        __syncthreads();
-        
-        // Copy next frontier to current and check if search space is exhausted
-        for (int i = tid; i < 8192; i += blockDim.x) {
-            if (s_next[i]) empty = false;
-            s_current[i] = s_next[i];
-        }
-        __syncthreads();
     }
     
-    if (tid == 0 && empty) {
-        atomicAdd(d_orphans, 1);
-    }
+    int res = kissat_solve(solver);
+    kissat_release(solver);
+    return (res == 20) ? 1 : 0;
 }
 
 /**
@@ -540,16 +508,25 @@ int main(int argc, char** argv) {
                 hipMemcpy(&h_hard_count, d_hard_count, sizeof(int), hipMemcpyDeviceToHost);
                 if (h_hard_count > 5000000) h_hard_count = 5000000;
                 
-                // Launch Phase 2: BFS for hard states
-                if (h_hard_count > 0) {
-                    printf("GPU Rank %d: Processing %d Hard States with BFS...\n", rank, h_hard_count);
-                    fflush(stdout);
-                    search_kernel_bfs<<<h_hard_count, 256>>>(d_hard_states, h_hard_count, d_orphans);
-                    hipDeviceSynchronize();
-                }
-                
                 unsigned long long my_orphans = 0;
                 hipMemcpy(&my_orphans, d_orphans, sizeof(unsigned long long), hipMemcpyDeviceToHost);
+
+                // Launch Phase 2: SAT solver for hard states
+                if (h_hard_count > 0) {
+                    printf("GPU Rank %d: Processing %d Hard States with Kissat...\n", rank, h_hard_count);
+                    fflush(stdout);
+                    uint64_t* h_hard_states = (uint64_t*)malloc(h_hard_count * sizeof(uint64_t));
+                    hipMemcpy(h_hard_states, d_hard_states, h_hard_count * sizeof(uint64_t), hipMemcpyDeviceToHost);
+                    
+                    unsigned long long sat_orphans = 0;
+                    #pragma omp parallel for reduction(+:sat_orphans) schedule(dynamic, 1)
+                    for (int i = 0; i < h_hard_count; i++) {
+                        if (solve_sat_hard_state(h_hard_states[i])) sat_orphans++;
+                    }
+                    
+                    my_orphans += sat_orphans;
+                    free(h_hard_states);
+                }
                 
                 // Reduce orphan counts globally
                 unsigned long long global_step_orphans = 0;
