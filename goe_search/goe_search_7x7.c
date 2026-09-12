@@ -1,3 +1,4 @@
+#include <math.h>
 /**
  * @file goe_search_7x7.c
  * @brief Game of Life 7x7 Garden of Eden (GOE) Prover
@@ -108,7 +109,8 @@ bool is_canonical(uint64_t T) {
  * @param failed Memoization table recording failed subpaths.
  * @return true if a predecessor exists, false otherwise.
  */
-bool has_predecessor(int row, int p1, int p2, uint64_t T, uint16_t current_id, uint16_t (*failed)[512][512]) {
+bool has_predecessor(int row, int p1, int p2, uint64_t T, uint16_t current_id, uint16_t (*failed)[512][512], uint64_t *dfs_nodes) {
+    (*dfs_nodes)++;
     if (row == 7) return true;
     if (failed[row][p1][p2] == current_id) return false;
 
@@ -132,7 +134,7 @@ bool has_predecessor(int row, int p1, int p2, uint64_t T, uint16_t current_id, u
             int p3_r = __builtin_ctz(valid_r);
             valid_r &= valid_r - 1;
             int p3 = p3_l | (p3_r << 4);
-            if (has_predecessor(row + 1, p2, p3, T, current_id, failed)) return true;
+            if (has_predecessor(row + 1, p2, p3, T, current_id, failed, dfs_nodes)) return true;
         }
     }
     
@@ -160,7 +162,7 @@ int main(int argc, char** argv) {
     int provided;
     // Require MPI thread support for OpenMP interoperability
     MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
-    omp_set_num_threads(16);
+
     
     int rank, num_procs;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -171,8 +173,12 @@ int main(int argc, char** argv) {
     
     // Total state space is 2^49 for a 7x7 grid
     uint64_t total_T = 1ULL << 49;
-    uint64_t step_size = num_procs * 1500000000ULL;
-    uint64_t T_current = 0, total_orphans = 0;
+    uint64_t T_current = 0, total_orphans = 0, total_canonical = 0, total_dfs = 0;
+    
+    // Sync initial state
+    MPI_Bcast(&T_current, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+    
+    uint64_t step_size = 10000000000ULL;
 
     // Rank 0 handles checkpoint loading
     if (rank == 0) {
@@ -180,6 +186,8 @@ int main(int argc, char** argv) {
         if (ckpt) {
             fscanf(ckpt, "%llu", (unsigned long long*)&T_current);
             fscanf(ckpt, "%llu", (unsigned long long*)&total_orphans);
+            fscanf(ckpt, "%llu", (unsigned long long*)&total_canonical);
+            fscanf(ckpt, "%llu", (unsigned long long*)&total_dfs);
             fclose(ckpt);
             printf("Resuming from T %llu\n", (unsigned long long)T_current);
         } else {
@@ -191,6 +199,8 @@ int main(int argc, char** argv) {
     // Broadcast state to all MPI ranks
     MPI_Bcast(&T_current, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
     MPI_Bcast(&total_orphans, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&total_canonical, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&total_dfs, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
 
     // Initial equal weights for dynamic load balancing
     double *node_weights = malloc(num_procs * sizeof(double));
@@ -200,7 +210,7 @@ int main(int argc, char** argv) {
 
     // Main search loop iterating in steps to allow load balancing updates
     while (T_current < total_T) {
-        uint64_t my_orphans = 0;
+        uint64_t my_orphans = 0, my_canonical = 0, my_dfs = 0;
         uint64_t T_end = T_current + step_size;
         if (T_end > total_T) T_end = total_T;
 
@@ -208,7 +218,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < num_procs; i++) total_weight += node_weights[i];
 
         // Assign task slices using a hash range distributed by node weight
-        uint64_t HASH_RANGE = 10000000;
+        uint64_t HASH_RANGE = 16777216ULL;
         double my_start_frac = 0;
         for (int i = 0; i < rank; i++) my_start_frac += node_weights[i] / total_weight;
         uint64_t my_start_hash = (uint64_t)(my_start_frac * HASH_RANGE);
@@ -227,17 +237,18 @@ int main(int argc, char** argv) {
                 // Thread-local memoization state
                 uint16_t (*failed)[512][512] = calloc(7, sizeof(*failed));
                 uint16_t current_id = 1;
-                unsigned long long local_orphans = 0;
+                uint64_t local_orphans = 0, local_canonical = 0, local_dfs = 0;
 
                 #pragma omp for schedule(dynamic, 10000)
                 for (uint64_t p = T_current; p < T_end; p++) {
                     
 
                     // Filter tasks based on hash assignment
-                    if (mix_hash(p) % HASH_RANGE < my_start_hash || mix_hash(p) % HASH_RANGE >= my_end_hash) continue;
+                    if ((mix_hash(p) & 16777215ULL) < my_start_hash || (mix_hash(p) & 16777215ULL) >= my_end_hash) continue;
                     
                     // Skip non-canonical patterns
                     if (!is_canonical(p)) continue;
+                    local_canonical++;
                     
                     // Fast memoization clear via ID increment
                     current_id++;
@@ -249,7 +260,7 @@ int main(int argc, char** argv) {
                     bool has_pred = false;
                     for (int p1 = 0; p1 < 512 && !has_pred; p1++) {
                         for (int p2 = 0; p2 < 512 && !has_pred; p2++) {
-                            if (has_predecessor(0, p1, p2, p, current_id, failed)) has_pred = true;
+                            if (has_predecessor(0, p1, p2, p, current_id, failed, &local_dfs)) has_pred = true;
                         }
                     }
                     if (!has_pred) local_orphans++;
@@ -257,6 +268,10 @@ int main(int argc, char** argv) {
 
                 #pragma omp atomic
                 my_orphans += local_orphans;
+                #pragma omp atomic
+                my_canonical += local_canonical;
+                #pragma omp atomic
+                my_dfs += local_dfs;
                 free(failed);
             }
         }
@@ -265,6 +280,7 @@ int main(int argc, char** argv) {
         if (my_compute_time < 0.001) my_compute_time = 0.001;
         
         // Calculate throughput and update exponential moving average for load balancing
+        if (my_compute_time < 0.001) my_compute_time = 0.001;
         double my_throughput = node_weights[rank] / my_compute_time;
         if (my_avg_compute_time < 0.0) my_avg_compute_time = my_throughput; 
         else my_avg_compute_time = 0.8 * my_avg_compute_time + 0.2 * my_throughput;
@@ -277,18 +293,22 @@ int main(int argc, char** argv) {
         // Normalize node weights
         double total_new_weight = 0;
         for(int i = 0; i < num_procs; i++) {
-            if (node_weights[i] < 0.0) node_weights[i] = 0.0;
+            if (node_weights[i] < 0.01) node_weights[i] = 0.01; // Enforce minimum floor to prevent starvation
             total_new_weight += node_weights[i];
         }
-        for(int i = 0; i < num_procs; i++) node_weights[i] = (node_weights[i] / total_new_weight) * 100.0;
+        if(total_new_weight > 0.0 && !isnan(total_new_weight)) { for(int i = 0; i < num_procs; i++) node_weights[i] = (node_weights[i] / total_new_weight) * 100.0; } else { for(int i = 0; i < num_procs; i++) node_weights[i] = 100.0 / num_procs; }
 
-        uint64_t global_orphans = 0;
+        uint64_t global_orphans = 0, global_canonical = 0, global_dfs = 0;
         
         // Sum up found orphan states across all nodes
         MPI_Reduce(&my_orphans, &global_orphans, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&my_canonical, &global_canonical, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(&my_dfs, &global_dfs, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
         if (rank == 0) {
             total_orphans += global_orphans;
+            total_canonical += global_canonical;
+            total_dfs += global_dfs;
             T_current = T_end;
             
             // Print progress and estimated time remaining
@@ -297,9 +317,9 @@ int main(int argc, char** argv) {
             double remaining = (total_T - T_current) / speed;
             int hours = (int)(remaining / 3600), minutes = (int)(remaining / 60) % 60;
             
-            printf("goe_search_7x7 %30.4f%% %lluKB %7.1f M-States/sec %02d:%02d ETA\n",
-                   ((double)T_current / total_T) * 100.0, total_orphans * sizeof(uint64_t) / 1024,
-                   speed / 1000000.0, hours, minutes);
+            printf("goe_search_7x7 %5.2f%% | Orphans: %llu | Canonical: %llu | DFS Nodes: %llu | %7.1f M-States/sec | %02d:%02d ETA\n",
+                   ((double)T_current / total_T) * 100.0, total_orphans,
+                   total_canonical, total_dfs, speed / 1000000.0, hours, minutes);
             fflush(stdout);
 
             // Periodic checkpointing (Atomic write for Spot Instances)
@@ -308,6 +328,8 @@ int main(int argc, char** argv) {
                 if (chk) {
                     fprintf(chk, "%llu\n", (unsigned long long)T_current);
                     fprintf(chk, "%llu\n", (unsigned long long)total_orphans);
+                    fprintf(chk, "%llu\n", (unsigned long long)total_canonical);
+                    fprintf(chk, "%llu\n", (unsigned long long)total_dfs);
                     fclose(chk);
                     rename("checkpoint_tmp.dat", "checkpoint.dat");
                 }
